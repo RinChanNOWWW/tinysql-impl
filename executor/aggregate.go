@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/set"
+	"github.com/spaolacci/murmur3"
 	"go.uber.org/zap"
 )
 
@@ -353,6 +354,22 @@ func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *s
 // We only support parallel execution for single-machine, so process of encode and decode can be skipped.
 func (w *HashAggPartialWorker) shuffleIntermData(sc *stmtctx.StatementContext, finalConcurrency int) {
 	// TODO: implement the method body. Shuffle the data to final workers.
+	groupKeysSlice := make([][]string, finalConcurrency)
+	for groupKey := range w.partialResultsMap {
+		finalWorker := int(murmur3.Sum32([]byte(groupKey))) % finalConcurrency
+		if groupKeysSlice[finalWorker] == nil {
+			groupKeysSlice[finalWorker] = make([]string, 0, len(w.partialResultsMap)/finalConcurrency)
+		}
+		groupKeysSlice[finalWorker] = append(groupKeysSlice[finalWorker], groupKey)
+	}
+	for i := range groupKeysSlice {
+		if groupKeysSlice[i] != nil {
+			w.outputChs[i] <- &HashAggIntermData{
+				groupKeys:        groupKeysSlice[i],
+				partialResultMap: w.partialResultsMap,
+			}
+		}
+	}
 }
 
 // getGroupKey evaluates the group items and args of aggregate functions.
@@ -423,7 +440,39 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 
 func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err error) {
 	// TODO: implement the method body. This method consumes the data given by the partial workers.
-	return nil
+	var (
+		input            *HashAggIntermData
+		ok               bool
+		intermDataBuffer [][]aggfuncs.PartialResult
+		groupKeys        []string
+		sc               = sctx.GetSessionVars().StmtCtx
+	)
+	for {
+		if input, ok = w.getPartialInput(); !ok {
+			return nil
+		}
+		if intermDataBuffer == nil {
+			intermDataBuffer = make([][]aggfuncs.PartialResult, 0, w.maxChunkSize)
+		}
+		for reachEnd := false; !reachEnd; {
+			intermDataBuffer, groupKeys, reachEnd = input.getPartialResultBatch(sc, intermDataBuffer[:0], w.aggFuncs, w.maxChunkSize)
+			for _, groupKey := range groupKeys {
+				w.groupKeys = append(w.groupKeys, []byte(groupKey))
+			}
+			results := w.getPartialResult(sc, w.groupKeys, w.partialResultMap)
+			for i, groupKey := range groupKeys {
+				if !w.groupSet.Exist(groupKey) {
+					w.groupSet.Insert(groupKey)
+				}
+				prs := intermDataBuffer[i]
+				for j, af := range w.aggFuncs {
+					if err := af.MergePartialResult(sctx, prs[j], results[i][j]); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 }
 
 func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
